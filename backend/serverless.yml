@@ -1,0 +1,553 @@
+service: cartflow-backend
+frameworkVersion: '3'
+
+configValidationMode: error
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  stage: ${opt:stage, 'dev'}
+  stageConfig: ${file(./config/${self:custom.stage}.yml)}
+  names:
+    table: ${self:service}-${self:custom.stage}-app
+    bucket: ${self:service}-${self:custom.stage}-${self:custom.stageConfig.resourceSuffix}-product-images
+    userPool: ${self:service}-${self:custom.stage}
+    userPoolClient: ${self:service}-${self:custom.stage}-web
+  esbuild:
+    bundle: true
+    minify: ${self:custom.stageConfig.esbuild.minify}
+    sourcemap: ${self:custom.stageConfig.esbuild.sourcemap}
+    target: node18
+    platform: node
+    concurrency: 10
+    exclude:
+      - '@aws-sdk/*'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: ${self:custom.stageConfig.region}
+  stage: ${self:custom.stage}
+  architecture: arm64
+  memorySize: ${self:custom.stageConfig.lambda.memorySize}
+  timeout: ${self:custom.stageConfig.lambda.timeout}
+  logRetentionInDays: ${self:custom.stageConfig.lambda.logRetentionInDays}
+  versionFunctions: false
+  deploymentMethod: direct
+  stackTags:
+    Application: CartFlow
+    Stage: ${self:custom.stage}
+    ManagedBy: ServerlessFramework
+  environment:
+    NODE_ENV: ${self:custom.stageConfig.nodeEnv}
+    NODE_OPTIONS: --enable-source-maps
+    AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+    CARTFLOW_TABLE_NAME:
+      Ref: CartFlowTable
+    PRODUCT_IMAGES_BUCKET_NAME:
+      Ref: ProductImagesBucket
+    COGNITO_USER_POOL_ID:
+      Ref: CartFlowUserPool
+    COGNITO_APP_CLIENT_ID:
+      Ref: CartFlowUserPoolClient
+    JWT_ISSUER:
+      Fn::Join:
+        - ''
+        - - https://cognito-idp.
+          - Ref: AWS::Region
+          - .amazonaws.com/
+          - Ref: CartFlowUserPool
+    ALLOWED_ORIGINS: ${self:custom.stageConfig.cors.allowedOriginsCsv}
+    UPLOAD_URL_EXPIRES_SECONDS: ${self:custom.stageConfig.uploads.presignedUrlExpiresSeconds}
+    MAX_UPLOAD_BYTES: ${self:custom.stageConfig.uploads.maxBytes}
+    DEFAULT_PAGE_LIMIT: ${self:custom.stageConfig.pagination.defaultLimit}
+    MAX_PAGE_LIMIT: ${self:custom.stageConfig.pagination.maxLimit}
+    ADMIN_GROUP_NAME: ${self:custom.stageConfig.auth.adminGroupName}
+    CUSTOMER_GROUP_NAME: ${self:custom.stageConfig.auth.customerGroupName}
+  httpApi:
+    cors:
+      allowedOrigins: ${self:custom.stageConfig.cors.allowedOrigins}
+      allowedHeaders:
+        - authorization
+        - content-type
+        - x-requested-with
+      allowedMethods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      allowCredentials: false
+      maxAge: 300
+    authorizers:
+      cognitoJwt:
+        type: jwt
+        identitySource: $request.header.Authorization
+        issuerUrl:
+          Fn::Join:
+            - ''
+            - - https://cognito-idp.
+              - Ref: AWS::Region
+              - .amazonaws.com/
+              - Ref: CartFlowUserPool
+        audience:
+          - Ref: CartFlowUserPoolClient
+  iam:
+    role:
+      statements:
+        - Sid: DynamoDBApplicationTableReadWrite
+          Effect: Allow
+          Action:
+            - dynamodb:BatchGetItem
+            - dynamodb:ConditionCheckItem
+            - dynamodb:DeleteItem
+            - dynamodb:DescribeTable
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:TransactWriteItems
+            - dynamodb:UpdateItem
+          Resource:
+            - Fn::GetAtt:
+                - CartFlowTable
+                - Arn
+        - Sid: DynamoDBGsi1Query
+          Effect: Allow
+          Action:
+            - dynamodb:Query
+          Resource:
+            - Fn::Join:
+                - ''
+                - - Fn::GetAtt:
+                      - CartFlowTable
+                      - Arn
+                  - /index/GSI1
+        - Sid: ProductImageObjectRead
+          Effect: Allow
+          Action:
+            - s3:AbortMultipartUpload
+            - s3:GetObject
+          Resource:
+            - Fn::Join:
+                - ''
+                - - Fn::GetAtt:
+                      - ProductImagesBucket
+                      - Arn
+                  - /products/*
+        - Sid: ProductImageObjectWrite
+          Effect: Allow
+          Action:
+            - s3:PutObject
+          Resource:
+            - Fn::Join:
+                - ''
+                - - Fn::GetAtt:
+                      - ProductImagesBucket
+                      - Arn
+                  - /products/*
+          # Enforced by S3 itself against the ACTUAL uploaded object size at
+          # PUT time, for both this presigning role and the resulting
+          # presigned URL — not just a client-declared Content-Length the
+          # app validated before generating the URL. A presigned PUT (unlike
+          # a presigned POST policy) cannot embed a size limit in the
+          # signature itself, so this IAM condition is what makes the 5 MB
+          # cap authoritative. See docs/database.md, "Upload Consistency And
+          # Security".
+          Condition:
+            NumericLessThanEquals:
+              s3:RequestObjectSize: ${self:custom.stageConfig.uploads.maxBytes}
+        - Sid: ProductImageBucketLocation
+          Effect: Allow
+          Action:
+            - s3:GetBucketLocation
+          Resource:
+            - Fn::GetAtt:
+                - ProductImagesBucket
+                - Arn
+
+package:
+  individually: true
+  patterns:
+    - '!coverage/**'
+    - '!tests/**'
+    - '!src/**/*.test.ts'
+
+functions:
+  health:
+    description: CartFlow health check. Business routes are added incrementally.
+    handler: src/handlers/health.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /health
+
+  productsList:
+    description: List active products, optionally filtered by category. Public.
+    handler: src/handlers/products/list.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /api/v1/products
+
+  productsGet:
+    description: Get a single product by id. Public.
+    handler: src/handlers/products/get.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /api/v1/products/{id}
+
+  productsGetInventory:
+    description: Get a product's public stock availability. Public.
+    handler: src/handlers/products/get-inventory.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /api/v1/products/{id}/inventory
+
+  productsCreate:
+    description: Create a product. Admin only.
+    handler: src/handlers/products/create.handler
+    events:
+      - httpApi:
+          method: POST
+          path: /api/v1/products
+          authorizer:
+            name: cognitoJwt
+
+  productsUpdate:
+    description: Update editable fields on a product. Admin only.
+    handler: src/handlers/products/update.handler
+    events:
+      - httpApi:
+          method: PUT
+          path: /api/v1/products/{id}
+          authorizer:
+            name: cognitoJwt
+
+  productsDelete:
+    description: Deactivate (soft delete) a product. Admin only.
+    handler: src/handlers/products/remove.handler
+    events:
+      - httpApi:
+          method: DELETE
+          path: /api/v1/products/{id}
+          authorizer:
+            name: cognitoJwt
+
+  productsAdminList:
+    description: List products by status (defaults ACTIVE), for the admin dashboard. Admin only.
+    handler: src/handlers/products/admin-list.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /api/v1/admin/products
+          authorizer:
+            name: cognitoJwt
+
+  adminInventoryGet:
+    description: Get the full inventory record (available/reserved/reorder threshold) for a product. Admin only.
+    handler: src/handlers/inventory/admin-get.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /api/v1/admin/inventory/{id}
+          authorizer:
+            name: cognitoJwt
+
+  adminInventoryUpdate:
+    description: Set a product's available quantity and/or reorder threshold. Admin only.
+    handler: src/handlers/inventory/admin-update.handler
+    events:
+      - httpApi:
+          method: PUT
+          path: /api/v1/admin/inventory/{id}
+          authorizer:
+            name: cognitoJwt
+
+  cartGet:
+    description: Get the authenticated caller's own cart, hydrated with current prices.
+    handler: src/handlers/cart/get.handler
+    events:
+      - httpApi:
+          method: GET
+          path: /api/v1/cart
+          authorizer:
+            name: cognitoJwt
+
+  cartAddItem:
+    description: Add a product to the authenticated caller's cart.
+    handler: src/handlers/cart/add-item.handler
+    events:
+      - httpApi:
+          method: POST
+          path: /api/v1/cart/items
+          authorizer:
+            name: cognitoJwt
+
+  cartUpdateItem:
+    description: Set an existing cart line to an absolute quantity.
+    handler: src/handlers/cart/update-item.handler
+    events:
+      - httpApi:
+          method: PATCH
+          path: /api/v1/cart/items/{productId}
+          authorizer:
+            name: cognitoJwt
+
+  cartRemoveItem:
+    description: Remove a line from the authenticated caller's cart.
+    handler: src/handlers/cart/remove-item.handler
+    events:
+      - httpApi:
+          method: DELETE
+          path: /api/v1/cart/items/{productId}
+          authorizer:
+            name: cognitoJwt
+
+  cartClear:
+    description: Empty the authenticated caller's cart.
+    handler: src/handlers/cart/clear.handler
+    events:
+      - httpApi:
+          method: DELETE
+          path: /api/v1/cart
+          authorizer:
+            name: cognitoJwt
+
+  uploadsCreatePresignedUrl:
+    description: Generate a presigned S3 PUT URL for a product image upload. Admin only.
+    handler: src/handlers/uploads/create-presigned-url.handler
+    events:
+      - httpApi:
+          method: POST
+          path: /api/v1/uploads/presigned-url
+          authorizer:
+            name: cognitoJwt
+
+resources:
+  Resources:
+    CartFlowTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: ${self:custom.stageConfig.dynamodb.deletionPolicy}
+      UpdateReplacePolicy: ${self:custom.stageConfig.dynamodb.deletionPolicy}
+      Properties:
+        TableName: ${self:custom.names.table}
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: ${self:custom.stageConfig.dynamodb.pointInTimeRecovery}
+        SSESpecification:
+          SSEEnabled: true
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK
+            AttributeType: S
+          - AttributeName: GSI1SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: GSI1PK
+                KeyType: HASH
+              - AttributeName: GSI1SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Application
+            Value: CartFlow
+          - Key: Stage
+            Value: ${self:custom.stage}
+
+    ProductImagesBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: ${self:custom.stageConfig.s3.deletionPolicy}
+      UpdateReplacePolicy: ${self:custom.stageConfig.s3.deletionPolicy}
+      Properties:
+        BucketName: ${self:custom.names.bucket}
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: BucketOwnerEnforced
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        VersioningConfiguration:
+          Status: ${self:custom.stageConfig.s3.versioningStatus}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - content-type
+                - x-amz-meta-product-id
+              AllowedMethods:
+                - PUT
+              AllowedOrigins: ${self:custom.stageConfig.cors.allowedOrigins}
+              ExposedHeaders:
+                - etag
+              MaxAge: 300
+        LifecycleConfiguration:
+          Rules:
+            - Id: AbortIncompleteMultipartUploads
+              Status: Enabled
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 1
+            - Id: ExpireTemporaryUploads
+              Status: Enabled
+              Prefix: tmp/
+              ExpirationInDays: ${self:custom.stageConfig.s3.temporaryUploadExpirationDays}
+        Tags:
+          - Key: Application
+            Value: CartFlow
+          - Key: Stage
+            Value: ${self:custom.stage}
+
+    CartFlowUserPool:
+      Type: AWS::Cognito::UserPool
+      DeletionPolicy: ${self:custom.stageConfig.cognito.deletionPolicy}
+      UpdateReplacePolicy: ${self:custom.stageConfig.cognito.deletionPolicy}
+      Properties:
+        UserPoolName: ${self:custom.names.userPool}
+        AutoVerifiedAttributes:
+          - email
+        UsernameAttributes:
+          - email
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        AdminCreateUserConfig:
+          AllowAdminCreateUserOnly: false
+        MfaConfiguration: 'OFF'
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 12
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+            RequireUppercase: true
+            TemporaryPasswordValidityDays: 7
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+        UserPoolTags:
+          Application: CartFlow
+          Stage: ${self:custom.stage}
+
+    CartFlowUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: ${self:custom.names.userPoolClient}
+        UserPoolId:
+          Ref: CartFlowUserPool
+        GenerateSecret: false
+        PreventUserExistenceErrors: ENABLED
+        ExplicitAuthFlows:
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+          # The React frontend signs in via @aws-sdk/client-cognito-identity-provider's
+          # InitiateAuth (USER_PASSWORD_AUTH), not the SRP protocol — trading the extra
+          # protection of never sending the password itself (SRP proves knowledge of it
+          # without transmitting it) for a browser client with no SRP math library
+          # dependency. This is safe only because the app already requires HTTPS in
+          # every real deployment, so the password is still protected in transit by TLS.
+          - ALLOW_USER_PASSWORD_AUTH
+        SupportedIdentityProviders:
+          - COGNITO
+        AllowedOAuthFlowsUserPoolClient: true
+        AllowedOAuthFlows:
+          - code
+        AllowedOAuthScopes:
+          - email
+          - openid
+          - profile
+        CallbackURLs: ${self:custom.stageConfig.cognito.callbackUrls}
+        LogoutURLs: ${self:custom.stageConfig.cognito.logoutUrls}
+        AccessTokenValidity: 60
+        IdTokenValidity: 60
+        RefreshTokenValidity: 30
+        TokenValidityUnits:
+          AccessToken: minutes
+          IdToken: minutes
+          RefreshToken: days
+
+    CustomerUserPoolGroup:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: ${self:custom.stageConfig.auth.customerGroupName}
+        Description: Standard CartFlow customer users.
+        Precedence: 20
+        UserPoolId:
+          Ref: CartFlowUserPool
+
+    AdminUserPoolGroup:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: ${self:custom.stageConfig.auth.adminGroupName}
+        Description: CartFlow administrators with catalog and inventory privileges.
+        Precedence: 10
+        UserPoolId:
+          Ref: CartFlowUserPool
+
+  Outputs:
+    HttpApiId:
+      Description: API Gateway HTTP API identifier.
+      Value:
+        Ref: HttpApi
+    HttpApiUrl:
+      Description: API Gateway HTTP API base URL.
+      Value:
+        Fn::Join:
+          - ''
+          - - https://
+            - Ref: HttpApi
+            - .execute-api.
+            - Ref: AWS::Region
+            - .amazonaws.com
+    DynamoDBTableName:
+      Description: CartFlow DynamoDB table name.
+      Value:
+        Ref: CartFlowTable
+    ProductImagesBucketName:
+      Description: Private S3 bucket for product image uploads.
+      Value:
+        Ref: ProductImagesBucket
+    CognitoUserPoolId:
+      Description: Cognito User Pool ID.
+      Value:
+        Ref: CartFlowUserPool
+    CognitoUserPoolClientId:
+      Description: Cognito User Pool web app client ID.
+      Value:
+        Ref: CartFlowUserPoolClient
+    CognitoIssuer:
+      Description: JWT issuer URL for API Gateway HTTP API authorizer and Lambda validation.
+      Value:
+        Fn::Join:
+          - ''
+          - - https://cognito-idp.
+            - Ref: AWS::Region
+            - .amazonaws.com/
+            - Ref: CartFlowUserPool
+    AdminGroupName:
+      Description: Cognito group name used for admin authorization.
+      Value: ${self:custom.stageConfig.auth.adminGroupName}
+    CustomerGroupName:
+      Description: Cognito group name used for customer authorization.
+      Value: ${self:custom.stageConfig.auth.customerGroupName}

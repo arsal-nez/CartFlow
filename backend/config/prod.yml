@@ -1,0 +1,45 @@
+region: us-east-1
+nodeEnv: production
+resourceSuffix: app
+
+lambda:
+  memorySize: 512
+  timeout: 10
+  logRetentionInDays: 30
+
+cors:
+  allowedOrigins:
+    - https://cartflow.example.com
+  allowedOriginsCsv: https://cartflow.example.com
+
+uploads:
+  presignedUrlExpiresSeconds: '300'
+  maxBytes: '5242880'
+
+pagination:
+  defaultLimit: '20'
+  maxLimit: '100'
+
+auth:
+  customerGroupName: customer
+  adminGroupName: admin
+
+dynamodb:
+  deletionPolicy: Retain
+  pointInTimeRecovery: true
+
+s3:
+  deletionPolicy: Retain
+  versioningStatus: Enabled
+  temporaryUploadExpirationDays: 1
+
+cognito:
+  deletionPolicy: Retain
+  callbackUrls:
+    - https://cartflow.example.com/auth/callback
+  logoutUrls:
+    - https://cartflow.example.com/
+
+esbuild:
+  minify: true
+  sourcemap: false

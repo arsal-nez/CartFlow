@@ -1,0 +1,103 @@
+name: Deploy
+
+# Deploys on every push to main — but the `backend-ci`/`frontend-ci` jobs
+# below are the *actual* CI workflows (called as reusable workflows, not
+# re-implemented), and every deploy job requires both via `needs:`. If
+# either fails, GitHub Actions never starts a deploy job — there is no
+# separate "wait for CI" polling step, the job graph itself is the gate.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+# Never run two production deploys for the same ref concurrently.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backend-ci:
+    name: Backend CI (required)
+    uses: ./.github/workflows/backend-ci.yml
+
+  frontend-ci:
+    name: Frontend CI (required)
+    uses: ./.github/workflows/frontend-ci.yml
+
+  deploy-backend:
+    name: Deploy backend (Serverless Framework -> AWS)
+    needs: [backend-ci, frontend-ci]
+    runs-on: ubuntu-latest
+    environment: production
+    # `id-token: write` is what lets `aws-actions/configure-aws-credentials`
+    # exchange this job's short-lived OIDC token for temporary AWS
+    # credentials — no long-lived AWS access key/secret is stored anywhere
+    # in GitHub or in source control. See README.md, "Configuring deploy
+    # credentials".
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: npm install
+        run: npm install
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Deploy with Serverless Framework
+        working-directory: backend
+        run: npm run deploy
+
+  deploy-frontend:
+    name: Deploy frontend (Vercel)
+    needs: [backend-ci, frontend-ci]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # `vercel pull` fetches this project's settings using the token/org/
+      # project id above — nothing sensitive is ever written to the repo.
+      # The Vercel project's "Root Directory" is expected to be set to
+      # `frontend/` (see README.md, "Configuring deploy credentials").
+      - name: Pull Vercel project settings
+        working-directory: frontend
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Build for Vercel
+        working-directory: frontend
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy prebuilt output
+        working-directory: frontend
+        run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"

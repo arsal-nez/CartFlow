@@ -1,0 +1,45 @@
+region: us-east-1
+nodeEnv: development
+resourceSuffix: local
+
+lambda:
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 7
+
+cors:
+  allowedOrigins:
+    - http://localhost:5173
+  allowedOriginsCsv: http://localhost:5173
+
+uploads:
+  presignedUrlExpiresSeconds: '300'
+  maxBytes: '5242880'
+
+pagination:
+  defaultLimit: '20'
+  maxLimit: '100'
+
+auth:
+  customerGroupName: customer
+  adminGroupName: admin
+
+dynamodb:
+  deletionPolicy: Delete
+  pointInTimeRecovery: false
+
+s3:
+  deletionPolicy: Delete
+  versioningStatus: Suspended
+  temporaryUploadExpirationDays: 1
+
+cognito:
+  deletionPolicy: Delete
+  callbackUrls:
+    - http://localhost:5173/auth/callback
+  logoutUrls:
+    - http://localhost:5173/
+
+esbuild:
+  minify: false
+  sourcemap: true

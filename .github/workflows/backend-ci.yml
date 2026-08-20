@@ -1,0 +1,60 @@
+name: Backend CI
+
+# Runs on every PR that touches the backend (or shared root config), and on
+# pushes to main for a post-merge sanity check. Also exposed as a reusable
+# workflow (`workflow_call`) so `deploy.yml` can require this exact same job
+# to succeed before it will deploy anything — see that file's `needs:`.
+on:
+  pull_request:
+    paths:
+      - 'backend/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.base.json'
+      - '.github/workflows/backend-ci.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.base.json'
+      - '.github/workflows/backend-ci.yml'
+  workflow_call: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Install, lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # A single root package-lock.json covers both npm workspaces
+      # (backend + frontend); `npm install` at the root is what actually
+      # wires up @cartflow/backend's dependencies.
+      - name: npm install
+        run: npm install
+
+      - name: Lint
+        run: npm run lint --workspace=backend
+
+      - name: Typecheck
+        run: npm run typecheck --workspace=backend
+
+      - name: Test
+        run: npm run test --workspace=backend
+
+      - name: Build
+        run: npm run build --workspace=backend
