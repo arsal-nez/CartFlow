@@ -5,10 +5,36 @@ configValidationMode: error
 
 plugins:
   - serverless-esbuild
+  # Must come after serverless-esbuild: offline serves the esbuild-bundled
+  # handlers, so esbuild's build hooks need to run first. Runs the API
+  # locally (API Gateway HTTP API + Lambda emulation) — no AWS deployment
+  # required. DynamoDB, S3, and Cognito are still the real AWS resources for
+  # whichever `--stage` is targeted; this plugin does not stand up local
+  # replacements for them.
+  - serverless-offline
 
 custom:
   stage: ${opt:stage, 'dev'}
   stageConfig: ${file(./config/${self:custom.stage}.yml)}
+  serverless-offline:
+    # serverless-offline's HTTP-API JWT-authorizer emulation is broken in
+    # the installed version (12.0.4, the newest release compatible with
+    # Serverless Framework v3): `authJWTSettingsExtractor` returns
+    # `{ authorizerName }`, but `createJWTAuthScheme` reads `.name` off that
+    # same object, so it crashes with "only supports retrieving JWT from
+    # the headers (undefined)" on every authenticated route the moment
+    # offline tries to configure it — before it ever finishes starting.
+    # Confirmed by reading the plugin's own source, not assumed; the same
+    # bug is present in every published 12.x release. `noAuth: true` is the
+    # plugin's own documented escape hatch: it skips attaching an
+    # authorizer strategy locally and leaves the real `cognitoJwt`
+    # authorizer definition below completely untouched for actual
+    # deployment. Practical effect locally: public routes work exactly as
+    # deployed; authenticated/admin routes run without a verified
+    # `event.requestContext.authorizer`, so `getCurrentUser()` sees no
+    # claims and `requireAuthentication()`/`requireAdmin()` correctly
+    # 401 — there's no local stand-in for a real Cognito JWT.
+    noAuth: true
   names:
     table: ${self:service}-${self:custom.stage}-app
     bucket: ${self:service}-${self:custom.stage}-${self:custom.stageConfig.resourceSuffix}-product-images

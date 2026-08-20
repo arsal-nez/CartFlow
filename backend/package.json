@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "jest --passWithNoTests",
+    "dev": "serverless offline --stage dev",
     "build": "serverless package --stage dev",
     "deploy": "serverless deploy --stage prod"
   },
@@ -32,6 +33,7 @@
     "js-yaml": "^4.1.0",
     "serverless": "^3.39.0",
     "serverless-esbuild": "^1.53.0",
+    "serverless-offline": "^12.0.4",
     "ts-jest": "^29.2.4",
     "typescript": "^5.5.4"
   }
