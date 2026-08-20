@@ -45,16 +45,62 @@ describe('errorHandler', () => {
     expect(parseBody(response).error).toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
-  it('maps UnauthorizedError to 401', async () => {
-    const response = await runOnError(new UnauthorizedError());
+  it('maps UnauthorizedError to 401 and logs a structured authorization-failure entry', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const response = await runOnError(
+      new UnauthorizedError(),
+      buildEvent({ path: '/api/v1/cart', requestId: 'req-401' }),
+    );
+
     expect(response.statusCode).toBe(401);
     expect(parseBody(response).error).toMatchObject({ code: 'UNAUTHORIZED' });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const [warnLine] = warnSpy.mock.calls[0] as [string];
+    const logged: unknown = JSON.parse(warnLine);
+    expect(logged).toMatchObject({
+      message: 'Authorization failure',
+      code: 'UNAUTHORIZED',
+      requestId: 'req-401',
+      method: 'GET',
+      path: '/api/v1/cart',
+      callerUserId: null,
+    });
+
+    warnSpy.mockRestore();
   });
 
-  it('maps ForbiddenError to 403', async () => {
-    const response = await runOnError(new ForbiddenError());
+  it('maps ForbiddenError to 403 and logs the authenticated caller responsible', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const response = await runOnError(
+      new ForbiddenError(),
+      buildEvent({ claims: { sub: 'user-42', 'cognito:groups': '["customer"]' } }),
+    );
+
     expect(response.statusCode).toBe(403);
     expect(parseBody(response).error).toMatchObject({ code: 'FORBIDDEN' });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [errorLine] = errorSpy.mock.calls[0] as [string];
+    const logged: unknown = JSON.parse(errorLine);
+    expect(logged).toMatchObject({
+      message: 'Authorization failure',
+      code: 'FORBIDDEN',
+      callerUserId: 'user-42',
+    });
+
+    errorSpy.mockRestore();
+  });
+
+  it('never logs the error message/body for an authorization failure — metadata only', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await runOnError(new UnauthorizedError('a message that must never be echoed into the log'));
+
+    const [loggedLine] = warnSpy.mock.calls[0] as [string];
+    expect(loggedLine).not.toContain('must never be echoed');
+
+    warnSpy.mockRestore();
   });
 
   it('maps NotFoundError to 404', async () => {

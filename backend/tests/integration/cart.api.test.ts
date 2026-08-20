@@ -25,6 +25,7 @@ import type { Cart } from '../../src/domain/cart';
 import type { Inventory } from '../../src/domain/inventory';
 import type { Product } from '../../src/domain/product';
 import type { CartRepository } from '../../src/repositories/cart.repository';
+import type { IdempotencyRepository } from '../../src/repositories/idempotency.repository';
 import type { InventoryRepository } from '../../src/repositories/inventory.repository';
 import type { ProductRepository } from '../../src/repositories/product.repository';
 import { createCartService } from '../../src/services/cart.service';
@@ -94,14 +95,19 @@ function setup() {
     getInventory: jest.fn(),
     updateInventory: jest.fn(),
   };
+  const idempotencyRepository: jest.Mocked<IdempotencyRepository> = {
+    getRecord: jest.fn().mockResolvedValue(null),
+    saveRecord: jest.fn().mockResolvedValue(undefined),
+  };
   const service = createCartService({ cartRepository, productRepository, inventoryRepository });
 
   return {
     cartRepository,
     productRepository,
     inventoryRepository,
+    idempotencyRepository,
     handlers: {
-      add: buildAddCartItemHandler(service),
+      add: buildAddCartItemHandler(service, idempotencyRepository),
       get: buildGetCartHandler(service),
       update: buildUpdateCartItemHandler(service),
       remove: buildRemoveCartItemHandler(service),
@@ -252,6 +258,100 @@ describe('POST /api/v1/cart/items (full stack)', () => {
     expect(result.statusCode).toBe(500);
     expect(JSON.stringify(parseBody(result))).not.toContain('DynamoDB is unreachable');
     consoleSpy.mockRestore();
+  });
+});
+
+describe('POST /api/v1/cart/items — Idempotency-Key (full stack)', () => {
+  it('replays the cached response and adds the line only once on a retried request', async () => {
+    const {
+      cartRepository,
+      productRepository,
+      inventoryRepository,
+      idempotencyRepository,
+      handlers,
+    } = setup();
+    productRepository.getById.mockResolvedValue(activeProduct());
+    inventoryRepository.getInventory.mockResolvedValue(inventory());
+    cartRepository.getCart.mockResolvedValueOnce(emptyCart());
+    cartRepository.updateCart.mockResolvedValueOnce(
+      emptyCart({
+        items: [
+          { userId: USER_ID, productId: PRODUCT_ID, quantity: 2, createdAt: 'x', updatedAt: 'x' },
+        ],
+      }),
+    );
+
+    // A fresh event per call, not one reused reference: `@middy/http-json-body-parser`
+    // mutates `event.body` from a JSON string into the parsed object in
+    // place, so replaying the same event object a second time would fail
+    // to re-parse it — a real client's retry is a genuinely new HTTP
+    // request/event, which this mirrors.
+    const buildRequest = () =>
+      buildEvent({
+        method: 'POST',
+        path: '/api/v1/cart/items',
+        body: { productId: PRODUCT_ID, quantity: 2 },
+        claims: CLAIMS,
+        headers: { 'idempotency-key': 'retry-key-1' },
+      });
+
+    const first = await handlers.add(buildRequest(), fakeLambdaContext);
+    expect(first.statusCode).toBe(201);
+    expect(cartRepository.updateCart).toHaveBeenCalledTimes(1);
+    expect(idempotencyRepository.saveRecord).toHaveBeenCalledTimes(1);
+
+    // Simulate the retry actually finding what the first call saved.
+    const [, savedRecord] = idempotencyRepository.saveRecord.mock.calls[0] as [
+      string,
+      { responseJson: string },
+      number,
+    ];
+    idempotencyRepository.getRecord.mockResolvedValueOnce(savedRecord);
+
+    const second = await handlers.add(buildRequest(), fakeLambdaContext);
+
+    expect(second.statusCode).toBe(first.statusCode);
+    expect(second.body).toBe(first.body);
+    // The retry never touched the cart at all — quantity was not doubled.
+    expect(cartRepository.updateCart).toHaveBeenCalledTimes(1);
+    expect(cartRepository.getCart).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not dedupe two requests with different keys — both mutate the cart', async () => {
+    const { cartRepository, productRepository, inventoryRepository, handlers } = setup();
+    productRepository.getById.mockResolvedValue(activeProduct());
+    inventoryRepository.getInventory.mockResolvedValue(inventory());
+    cartRepository.getCart.mockResolvedValue(emptyCart());
+    cartRepository.updateCart.mockResolvedValue(
+      emptyCart({
+        items: [
+          { userId: USER_ID, productId: PRODUCT_ID, quantity: 2, createdAt: 'x', updatedAt: 'x' },
+        ],
+      }),
+    );
+
+    await handlers.add(
+      buildEvent({
+        method: 'POST',
+        path: '/api/v1/cart/items',
+        body: { productId: PRODUCT_ID, quantity: 2 },
+        claims: CLAIMS,
+        headers: { 'idempotency-key': 'key-a' },
+      }),
+      fakeLambdaContext,
+    );
+    await handlers.add(
+      buildEvent({
+        method: 'POST',
+        path: '/api/v1/cart/items',
+        body: { productId: PRODUCT_ID, quantity: 2 },
+        claims: CLAIMS,
+        headers: { 'idempotency-key': 'key-b' },
+      }),
+      fakeLambdaContext,
+    );
+
+    expect(cartRepository.updateCart).toHaveBeenCalledTimes(2);
   });
 });
 

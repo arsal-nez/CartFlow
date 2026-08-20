@@ -20,6 +20,15 @@ pagination:
   defaultLimit: '20'
   maxLimit: '100'
 
+# Account-/stage-level API Gateway throttling (default route settings —
+# applies to every route that doesn't declare its own). Low on purpose in
+# dev: this stage is meant for a single developer, and a low ceiling makes a
+# runaway local test loop or misbehaving script fail fast and visibly rather
+# than quietly burn through the AWS account's request quota.
+throttle:
+  burstLimit: 20
+  rateLimit: 10
+
 auth:
   customerGroupName: customer
   adminGroupName: admin

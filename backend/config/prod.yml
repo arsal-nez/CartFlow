@@ -20,6 +20,19 @@ pagination:
   defaultLimit: '20'
   maxLimit: '100'
 
+# Account-/stage-level API Gateway throttling (default route settings —
+# applies to every route that doesn't declare its own). This is a coarse,
+# free-tier safety net against a runaway client or a naive scraping/abuse
+# script — it is NOT a substitute for per-user/per-IP rate limiting (API
+# Gateway HTTP API has no native per-key throttling without an added usage
+# plan + API key model, which conflicts with this API's public,
+# unauthenticated read routes). See PRODUCTION_READINESS.md, "Rate
+# limiting", for what this does and doesn't cover and the AWS WAF follow-up
+# recommended before high-traffic production use.
+throttle:
+  burstLimit: 50
+  rateLimit: 25
+
 auth:
   customerGroupName: customer
   adminGroupName: admin

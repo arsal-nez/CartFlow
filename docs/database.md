@@ -504,3 +504,109 @@ Image:
 - Consider TTL for stale upload records and abandoned carts if needed.
 - Keep item sizes below DynamoDB limits by storing image objects in S3, not in table attributes.
 
+## IAM: Per-Function Least Privilege
+
+Every Lambda function in `serverless.yml` carries an explicit `role:` pointing at one
+of three purpose-built `AWS::IAM::Role` resources, instead of every function sharing
+one `provider.iam.role.statements` block sized for the most privileged handler in the
+service (the original design — see PRODUCTION_READINESS.md, "IAM", for the audit that
+changed this). Under that shared-role design, a compromised *public, unauthenticated*
+handler like `productsGet` ran with permission to `PutItem`/`UpdateItem`/`DeleteItem`
+on the entire table, because the role had to cover every function's needs at once.
+
+The three roles, and which functions get each:
+
+- **`PublicReadExecutionRole`** — `dynamodb:GetItem`/`Query`/`DescribeTable` on the
+  table, plus `Query` on `GSI1`. No write action of any kind. Used by `productsList`,
+  `productsGet`, `productsGetInventory` — the only unauthenticated routes in the API.
+- **`CustomerCartExecutionRole`** — `dynamodb:GetItem`/`PutItem`/`Query`/
+  `TransactWriteItems` on the table only (no GSI1, no S3, no `DeleteItem`). Used by
+  `cartGet`, `cartAddItem`, `cartUpdateItem`, `cartRemoveItem`, `cartClear`. Cart writes
+  never issue a raw `DeleteItem` — line removal goes through `TransactWriteCommand`'s
+  `Delete` action inside a transaction, which the `TransactWriteItems` API action alone
+  covers — see `repositories/cart.repository.ts`.
+- **`AdminWriteExecutionRole`** — full table read/write (`GetItem`/`PutItem`/
+  `UpdateItem`/`Query`/`DescribeTable`, plus `Query` on `GSI1`) and S3
+  `PutObject`/`GetObject`/`AbortMultipartUpload`/`GetBucketLocation` on
+  `ProductImagesBucket`'s `products/*` prefix (with the same `s3:RequestObjectSize`
+  condition as before — see "Upload Consistency And Security" above). Used by every
+  admin-only handler: `productsCreate`, `productsUpdate`, `productsDelete`,
+  `productsAdminList`, `adminInventoryGet`, `adminInventoryUpdate`,
+  `uploadsCreatePresignedUrl`.
+
+`health` intentionally has no `role:` override — it touches no AWS resource, so the
+bare default role Serverless Framework generates (just the `AWSLambdaBasicExecutionRole`
+managed policy, for CloudWatch Logs) is already least-privilege for it.
+
+Two actions that existed in the old shared role were dropped entirely rather than
+assigned to any role: `dynamodb:BatchGetItem` and `dynamodb:ConditionCheckItem`. Neither
+`BatchGetCommand` nor a `ConditionCheck`-typed transact item is issued anywhere in the
+codebase (verified by grep, not assumed) — granting them was pure unused surface area.
+`dynamodb:DeleteItem` was also dropped: `ProductRepository.delete()` (a hard-delete
+method) exists on the repository interface and is exercised by its unit tests, but no
+handler calls it — every product removal goes through `deactivate()` (an `UpdateCommand`
+soft delete). If a hard-delete endpoint is ever added, `AdminWriteExecutionRole` needs
+`dynamodb:DeleteItem` added back deliberately at that point.
+
+`tests/unit/infra/serverless-config.test.ts` parses `serverless.yml` directly (not a
+copy) and asserts every function except `health` has an explicit, known `role:`, so
+a new function added later without one fails a test instead of silently inheriting
+whatever the default happens to be.
+
+## Idempotency
+
+Every mutation in this API except two is naturally idempotent by construction, so no
+special handling was needed:
+
+- `PUT /api/v1/products/{id}` and `PUT /api/v1/admin/inventory/{id}` set an *absolute*
+  state — replaying the same request twice produces the same end state both times.
+- `DELETE /api/v1/products/{id}` (soft delete) and `DELETE /api/v1/cart` /
+  `DELETE /api/v1/cart/items/{productId}` are no-ops the second time (already-archived,
+  already-empty, already-removed) — see the relevant service methods.
+- `PATCH /api/v1/cart/items/{productId}` sets an absolute quantity, same as the `PUT`
+  cases above.
+
+Two endpoints are genuinely **not** naturally idempotent, because they create a new
+side effect from otherwise-identical input:
+
+- `POST /api/v1/cart/items` — a retried "add to cart" (client timeout, a double-tapped
+  button, a flaky mobile network) would add the quantity a second time, silently
+  doubling it.
+- `POST /api/v1/products` — `productId` is server-generated (`randomUUID()`); a retried
+  create would mint a *different* id each time and create two separate products, with
+  nothing to conflict on. (The conditional `PutItem` in `ProductRepository.create` only
+  guards against the same id being reused, which never happens naturally between two
+  independent calls to `randomUUID()`.)
+
+`middleware/idempotency.ts` covers both, via an optional `Idempotency-Key` request
+header (client-chosen, a UUID is the usual choice, opaque to the server). First sight
+of a key runs the handler normally and caches the complete response (status, headers,
+body) keyed by `{namespace}#{callerUserId}#{key}`; a repeat within the TTL window (24h
+default) replays that exact cached response instead of re-running the handler. Records
+live in the same table (`PK = IDEMPOTENCY#{scopeKey}, SK = RECORD`) with a `ttl`
+attribute so DynamoDB expires them automatically — see `CartFlowTable`'s
+`TimeToLiveSpecification` in `serverless.yml` and `repositories/idempotency.repository.ts`.
+
+Two implementation details worth knowing if you touch this middleware:
+
+- **Registration order is load-bearing.** It must be `.use()`d *before* `httpCors()` in
+  the Middy chain. Middy (v5) skips every `after` middleware — not just later-registered
+  ones — for a request a `before` hook short-circuits by setting `response` (confirmed
+  by reading `@middy/core`'s `runRequest`, not assumed from the docs). A cached replay
+  is exactly that kind of short-circuit, so unless idempotency runs first (making its
+  own `after`, which persists the record, run *last* — after `httpCors`'s `after` has
+  already added the CORS header on the original request), a replayed response would
+  silently come back without `Access-Control-Allow-Origin` and break real cross-origin
+  retries. `tests/unit/middleware/idempotency.test.ts` has a regression test for exactly
+  this.
+- **Only successful (2xx) responses are cached.** An error — including a transient
+  500 — is never remembered against the key, so a client that legitimately failed and
+  retries isn't permanently stuck replaying that failure.
+- **This dedupes sequential retries, not concurrent duplicates.** Two requests carrying
+  the same key that arrive genuinely at the same instant can both pass the cache-miss
+  check before either has saved a record, and both will execute. Closing that gap fully
+  would need a claim/lock step before the handler runs (e.g. a conditional "pending"
+  write consumed by the loser), which this intentionally doesn't add — the goal here is
+  retry-safety for the overwhelmingly common case (a client that timed out and tried
+  again), not a distributed lock.
+

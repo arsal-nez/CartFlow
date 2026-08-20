@@ -14,6 +14,7 @@ import { buildUpdateProductHandler } from '../../src/handlers/products/update';
 import { buildDeleteProductHandler } from '../../src/handlers/products/remove';
 import { buildListProductsHandler } from '../../src/handlers/products/list';
 import { resetEnvConfig } from '../../src/config/env';
+import type { IdempotencyRepository } from '../../src/repositories/idempotency.repository';
 import { createProductRepository } from '../../src/repositories/product.repository';
 import { createProductService } from '../../src/services/product.service';
 import {
@@ -45,10 +46,15 @@ function setup() {
   const { client, send } = createFakeDocumentClient();
   const repository = createProductRepository({ client, tableName: TABLE, now: fixedClock });
   const service = createProductService({ repository, idGenerator: () => PRODUCT_ID });
+  const idempotencyRepository: jest.Mocked<IdempotencyRepository> = {
+    getRecord: jest.fn().mockResolvedValue(null),
+    saveRecord: jest.fn().mockResolvedValue(undefined),
+  };
   return {
     send,
+    idempotencyRepository,
     handlers: {
-      create: buildCreateProductHandler(service),
+      create: buildCreateProductHandler(service, idempotencyRepository),
       get: buildGetProductHandler(service),
       update: buildUpdateProductHandler(service),
       remove: buildDeleteProductHandler(service),
@@ -178,6 +184,43 @@ describe('POST /api/v1/products (full stack)', () => {
     expect(body.error).toMatchObject({ code: 'INTERNAL_ERROR' });
     expect(JSON.stringify(body)).not.toContain('ETIMEDOUT');
     consoleSpy.mockRestore();
+  });
+});
+
+describe('POST /api/v1/products — Idempotency-Key (full stack)', () => {
+  it('replays the cached response and never issues a second PutCommand on a retried create', async () => {
+    const { send, idempotencyRepository, handlers } = setup();
+    send.mockResolvedValueOnce({});
+
+    // A fresh event per call — see the identical note in cart.api.test.ts:
+    // `@middy/http-json-body-parser` mutates `event.body` in place, so a
+    // real client retry is a new event, not a reused reference.
+    const buildRequest = () =>
+      buildEvent({
+        method: 'POST',
+        body: VALID_CREATE_BODY,
+        claims: ADMIN_CLAIMS,
+        headers: { 'idempotency-key': 'admin-retry-1' },
+      });
+
+    const first = await handlers.create(buildRequest(), fakeLambdaContext);
+    expect(first.statusCode).toBe(201);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(idempotencyRepository.saveRecord).toHaveBeenCalledTimes(1);
+
+    const [, savedRecord] = idempotencyRepository.saveRecord.mock.calls[0] as [
+      string,
+      { responseJson: string },
+      number,
+    ];
+    idempotencyRepository.getRecord.mockResolvedValueOnce(savedRecord);
+
+    const second = await handlers.create(buildRequest(), fakeLambdaContext);
+
+    expect(second).toEqual(first);
+    // Still just the one PutCommand from the first call — no duplicate
+    // product, and no second conditional-write attempt at all.
+    expect(send).toHaveBeenCalledTimes(1);
   });
 });
 
